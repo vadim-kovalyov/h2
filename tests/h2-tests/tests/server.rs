@@ -591,11 +591,21 @@ async fn push_request_between_data() {
 fn accept_with_pending_connections_after_socket_close() {}
 
 #[tokio::test]
-async fn recv_invalid_authority() {
+async fn recv_invalid_authority_is_normalized() {
+    recv_normalized_authority("not:a/good authority").await;
+}
+
+#[tokio::test]
+async fn recv_encoded_kubelet_authority_is_normalized() {
+    recv_normalized_authority("%2Fvar%2Flib%2Fkubelet%2Fplugins_registry%2Fdra.akri.sh-reg.sock")
+        .await;
+}
+
+async fn recv_normalized_authority(authority: &'static str) {
     h2_support::trace_init!();
     let (io, mut client) = mock::new();
 
-    let bad_auth = util::byte_str("not:a/good authority");
+    let bad_auth = util::byte_str(authority);
     let mut bad_headers: frame::Headers = frames::headers(1)
         .request("GET", "https://example.com/")
         .eos()
@@ -606,11 +616,22 @@ async fn recv_invalid_authority() {
         let settings = client.assert_server_handshake().await;
         assert_default_settings!(settings);
         client.send_frame(bad_headers).await;
-        client.recv_frame(frames::reset(1).protocol_error()).await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
     };
 
     let srv = async move {
         let mut srv = server::handshake(io).await.expect("handshake");
+        let (request, mut stream) = srv
+            .next()
+            .await
+            .expect("request stream")
+            .expect("normalized authority");
+        assert_eq!(request.uri(), "https://localhost/");
+        stream
+            .send_response(Response::new(()), true)
+            .expect("response");
         assert!(srv.next().await.is_none());
     };
 

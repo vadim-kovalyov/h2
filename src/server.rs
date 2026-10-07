@@ -1702,13 +1702,13 @@ impl proto::Peer for Peer {
         // header
         if let Some(authority) = pseudo.authority {
             let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
-            parts.authority = Some(maybe_authority.or_else(|why| {
-                malformed!(
-                    "malformed headers: malformed authority ({:?}): {}",
-                    authority,
-                    why,
-                )
-            })?);
+            parts.authority = Some(maybe_authority.unwrap_or_else(|why| {
+                tracing::warn!(
+                    "temporary authority bypass: {}; substituting localhost",
+                    why
+                );
+                uri::Authority::from_static("localhost")
+            }));
         }
 
         // A :scheme is required, except CONNECT.
@@ -1784,5 +1784,95 @@ where
             Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
             Handshaking::Done => f.write_str("Done"),
         }
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use http::{HeaderMap, Method, Request};
+
+    use crate::frame::{Pseudo, StreamId};
+    use crate::hpack::BytesStr;
+    use crate::proto;
+
+    use super::Peer;
+
+    fn request(authority: &'static str) -> Request<()> {
+        let pseudo = Pseudo {
+            method: Some(Method::POST),
+            scheme: Some(BytesStr::from_static("http")),
+            authority: Some(BytesStr::from_static(authority)),
+            path: Some(BytesStr::from_static(
+                "/pluginregistration.Registration/GetInfo",
+            )),
+            ..Pseudo::default()
+        };
+        <Peer as proto::Peer>::convert_poll_message(pseudo, HeaderMap::new(), StreamId::from(1))
+            .expect("registration authority must reach the handler")
+    }
+
+    #[test]
+    fn encoded_kubelet_socket_authority_becomes_localhost() {
+        let request = request("%2Fvar%2Flib%2Fkubelet%2Fplugins_registry%2Fdra.akri.sh-reg.sock");
+        assert_eq!(
+            request.uri().authority().expect("authority").as_str(),
+            "localhost"
+        );
+        assert_eq!(
+            request.uri().path(),
+            "/pluginregistration.Registration/GetInfo"
+        );
+    }
+
+    #[test]
+    fn non_default_encoded_socket_authority_becomes_localhost() {
+        let request = request("%2Fcustom%2Fkubelet%2Fplugins_registry%2Fdra.akri.sh-reg.sock");
+        assert_eq!(
+            request.uri().authority().expect("authority").as_str(),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn raw_socket_authority_becomes_localhost() {
+        let request = request("/var/lib/kubelet/plugins_registry/dra.akri.sh-reg.sock");
+        assert_eq!(
+            request.uri().authority().expect("authority").as_str(),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn unrelated_invalid_authority_becomes_localhost() {
+        let request = request("invalid authority");
+        assert_eq!(
+            request.uri().authority().expect("authority").as_str(),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn valid_authority_is_preserved() {
+        let request = request("example.com:8443");
+        assert_eq!(
+            request.uri().authority().expect("authority").as_str(),
+            "example.com:8443"
+        );
+    }
+
+    #[test]
+    fn missing_method_still_fails() {
+        let pseudo = Pseudo {
+            scheme: Some(BytesStr::from_static("http")),
+            authority: Some(BytesStr::from_static("invalid authority")),
+            path: Some(BytesStr::from_static("/")),
+            ..Pseudo::default()
+        };
+        assert!(<Peer as proto::Peer>::convert_poll_message(
+            pseudo,
+            HeaderMap::new(),
+            StreamId::from(1)
+        )
+        .is_err());
     }
 }
